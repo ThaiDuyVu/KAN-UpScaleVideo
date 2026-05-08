@@ -5,115 +5,177 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 import os
-import numpy as np
 from tqdm import tqdm
+
 from efficient_kan import KAN
-# Thư viện tính toán chỉ số
-from piq import psnr, ssim 
+from piq import psnr, ssim
 
-# 1. Cấu hình thiết bị
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("🚀 Using MPS (Metal GPU) on Mac")
-else:
-    device = torch.device("cpu")
-    print("⚠️ Using CPU")
+# =========================
+# 1. DEVICE SETUP (OPTIMIZED FOR V100)
+# =========================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Using device: {device}")
 
-# 2. Dataset (Giữ nguyên logic Resize để tránh lỗi Size)
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+# =========================
+# 2. DATASET (OPTIMIZED LOADER)
+# =========================
 class VideoDataset(Dataset):
     def __init__(self, root_dir, target_size=(160, 90)):
         self.hr_dir = os.path.join(root_dir, 'frames')
         self.lr_dir = os.path.join(root_dir, 'lr_frames')
         self.samples = []
-        self.hr_size = (target_size[1] * 2, target_size[0] * 2) # (H, W) cho PIL
+
+        self.hr_size = (target_size[1] * 2, target_size[0] * 2)
         self.lr_size = (target_size[1], target_size[0])
 
         for clip in sorted(os.listdir(self.hr_dir)):
-            if clip.startswith('.'): continue
+            if clip.startswith('.'):
+                continue
+
             hr_p = os.path.join(self.hr_dir, clip)
             lr_p = os.path.join(self.lr_dir, clip)
+
             if os.path.isdir(hr_p):
                 frames = sorted(os.listdir(hr_p))
                 for f in frames:
-                    if f.startswith('.'): continue
-                    self.samples.append((os.path.join(lr_p, f), os.path.join(hr_p, f)))
-        
-        self.transform_lr = transforms.Compose([transforms.Resize(self.lr_size), transforms.ToTensor()])
-        self.transform_hr = transforms.Compose([transforms.Resize(self.hr_size), transforms.ToTensor()])
+                    if f.startswith('.'):
+                        continue
+                    self.samples.append(
+                        (os.path.join(lr_p, f), os.path.join(hr_p, f))
+                    )
 
-    def __len__(self): return len(self.samples)
+        self.transform_lr = transforms.Compose([
+            transforms.Resize(self.lr_size),
+            transforms.ToTensor()
+        ])
+
+        self.transform_hr = transforms.Compose([
+            transforms.Resize(self.hr_size),
+            transforms.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        lr_img = self.transform_lr(Image.open(self.samples[idx][0]).convert('RGB'))
-        hr_img = self.transform_hr(Image.open(self.samples[idx][1]).convert('RGB'))
-        return lr_img, hr_img
+        lr_img = Image.open(self.samples[idx][0]).convert('RGB')
+        hr_img = Image.open(self.samples[idx][1]).convert('RGB')
 
-# 3. Kiến trúc KAN-SR
+        return self.transform_lr(lr_img), self.transform_hr(hr_img)
+
+# =========================
+# 3. MODEL (KAN-SR)
+# =========================
 class KAN_SR(nn.Module):
     def __init__(self):
-        super(KAN_SR, self).__init__()
-        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.kan = KAN([32, 64, 32], grid_size=3) 
+        super().__init__()
+
+        self.conv_in = nn.Conv2d(3, 32, 3, padding=1)
+
+        self.kan = KAN([32, 64, 32], grid_size=3)
+
         self.upsample = nn.Sequential(
-            nn.Conv2d(32, 128, kernel_size=3, padding=1),
+            nn.Conv2d(32, 128, 3, padding=1),
             nn.PixelShuffle(2),
-            nn.Conv2d(32, 3, kernel_size=3, padding=1),
+            nn.Conv2d(32, 3, 3, padding=1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
         b, c, h, w = x.shape
-        feat = torch.relu(self.conv_in(x))
-        feat_flat = feat.permute(0, 2, 3, 1).reshape(-1, 32)
-        out_kan = self.kan(feat_flat)
-        feat_res = out_kan.view(b, h, w, 32).permute(0, 3, 1, 2)
-        return self.upsample(feat_res)
 
-# 4. Huấn luyện và Đánh giá
+        feat = torch.relu(self.conv_in(x))
+
+        # OPTIMIZED FLATTEN
+        feat_flat = feat.permute(0, 2, 3, 1).reshape(-1, 32)
+
+        out = self.kan(feat_flat)
+
+        feat = out.view(b, h, w, 32).permute(0, 3, 1, 2)
+
+        return self.upsample(feat)
+
+# =========================
+# 4. TRAINING LOOP (GPU OPTIMIZED)
+# =========================
 def train():
-    dataset = VideoDataset('data')
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-    
+    dataset = VideoDataset("data")
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,              # V100 có thể tăng lên 8–16
+        shuffle=True,
+        num_workers=4,             # tăng tốc load data
+        pin_memory=True
+    )
+
     model = KAN_SR().to(device)
-    model_path = 'kan_upscale_v1.pth'
+
+    model_path = "kan_upscale_v1.pth"
     if os.path.exists(model_path):
-        print(f"♻️ Loading existing model: {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        print(f"♻️ Loading model: {model_path}")
+        model.load_state_dict(
+            torch.load(model_path, map_location=device)
+        )
 
     criterion = nn.L1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    # AMP (mixed precision)
+    scaler = torch.cuda.amp.GradScaler()
 
     for epoch in range(10):
         model.train()
-        epoch_loss, total_psnr, total_ssim = 0, 0, 0
+
+        total_loss = 0
+        total_psnr = 0
+        total_ssim = 0
+
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/10")
 
         for lr, hr in loop:
-            lr, hr = lr.to(device), hr.to(device)
-            
+            lr = lr.to(device, non_blocking=True)
+            hr = hr.to(device, non_blocking=True)
+
             optimizer.zero_grad()
-            output = model(lr)
-            loss = criterion(output, hr)
-            loss.backward()
-            optimizer.step()
 
-            # Tính toán chỉ số (không tính gradient để tiết kiệm bộ nhớ)
+            with torch.cuda.amp.autocast():
+                output = model(lr)
+                loss = criterion(output, hr)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += loss.item()
+
+            # metric (no grad)
             with torch.no_grad():
-                # PSNR & SSIM yêu cầu input trong dải [0, 1]
-                p_val = psnr(output, hr, data_range=1.0).item()
-                s_val = ssim(output, hr, data_range=1.0).item()
-                
-                total_psnr += p_val
-                total_ssim += s_val
-                epoch_loss += loss.item()
+                p = psnr(output, hr, data_range=1.0)
+                s = ssim(output, hr, data_range=1.0)
 
-            loop.set_postfix(Loss=f"{loss.item():.4f}", PSNR=f"{p_val:.2f}", SSIM=f"{s_val:.3f}")
+                total_psnr += p.item()
+                total_ssim += s.item()
 
-        # Tính trung bình cho cả epoch
-        avg_psnr = total_psnr / len(dataloader)
-        avg_ssim = total_ssim / len(dataloader)
-        print(f"\n✨ Epoch [{epoch+1}] Summary: Avg PSNR: {avg_psnr:.2f} dB | Avg SSIM: {avg_ssim:.4f}")
+            loop.set_postfix(
+                loss=loss.item(),
+                psnr=p.item(),
+                ssim=s.item()
+            )
+
+        print(
+            f"\n✨ Epoch {epoch+1}: "
+            f"Loss {total_loss/len(dataloader):.4f} | "
+            f"PSNR {total_psnr/len(dataloader):.2f} | "
+            f"SSIM {total_ssim/len(dataloader):.4f}"
+        )
 
         torch.save(model.state_dict(), model_path)
+
 
 if __name__ == "__main__":
     train()
