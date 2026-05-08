@@ -150,6 +150,8 @@ class KAN_SR_V3(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.shape
+        target_h = h * self.upscale_factor
+        target_w = w * self.upscale_factor
 
         base = F.interpolate(x, scale_factor=self.upscale_factor,
                              mode='bicubic', align_corners=False)
@@ -171,7 +173,13 @@ class KAN_SR_V3(nn.Module):
         fused    = feat + expanded
 
         residual = self.upsample(fused)
-        return torch.clamp(base + residual, 0.0, 1.0)
+        out = torch.clamp(base + residual, 0.0, 1.0)
+
+        # ✅ FIX: Đảm bảo output đúng kích thước target (tránh lệch pixel do stride)
+        if out.shape[2] != target_h or out.shape[3] != target_w:
+            out = F.interpolate(out, size=(target_h, target_w),
+                                mode='bilinear', align_corners=False)
+        return out
 
 
 # =========================
@@ -242,6 +250,12 @@ def run_epoch(model, dataloader, optimizer, criterion, perc_loss_fn,
 
         with torch.amp.autocast(device_type="cuda"):
             output = model(lr_img)
+
+            # ✅ FIX (safety net): Crop/resize về đúng size nếu vẫn lệch
+            if output.shape != hr_img.shape:
+                output = F.interpolate(output, size=hr_img.shape[2:],
+                                       mode='bilinear', align_corners=False)
+
             l1   = criterion(output, hr_img)
             perc = perc_loss_fn(output, hr_img)
             freq = frequency_loss(output, hr_img)
