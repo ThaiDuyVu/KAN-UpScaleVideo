@@ -147,6 +147,7 @@ class KAN_SR_V3(nn.Module):
 
         # Expand + merge
         expanded = self.post_kan(refined)        # [B, 64, H, W]
+        expanded = expanded[:, :, :h, :w]
         fused = feat + expanded                  # skip connection
 
         # Upsample residual
