@@ -11,7 +11,7 @@ from efficient_kan import KAN
 from piq import psnr, ssim
 
 # =========================
-# 1. DEVICE SETUP (OPTIMIZED FOR V100)
+# 1. DEVICE SETUP (V100 OPTIMIZED)
 # =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 Using device: {device}")
@@ -21,19 +21,19 @@ if device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
 
 # =========================
-# 2. DATASET (OPTIMIZED LOADER)
+# 2. DATASET
 # =========================
 class VideoDataset(Dataset):
     def __init__(self, root_dir, target_size=(160, 90)):
-        self.hr_dir = os.path.join(root_dir, 'frames')
-        self.lr_dir = os.path.join(root_dir, 'lr_frames')
+        self.hr_dir = os.path.join(root_dir, "frames")
+        self.lr_dir = os.path.join(root_dir, "lr_frames")
         self.samples = []
 
         self.hr_size = (target_size[1] * 2, target_size[0] * 2)
         self.lr_size = (target_size[1], target_size[0])
 
         for clip in sorted(os.listdir(self.hr_dir)):
-            if clip.startswith('.'):
+            if clip.startswith("."):
                 continue
 
             hr_p = os.path.join(self.hr_dir, clip)
@@ -42,7 +42,7 @@ class VideoDataset(Dataset):
             if os.path.isdir(hr_p):
                 frames = sorted(os.listdir(hr_p))
                 for f in frames:
-                    if f.startswith('.'):
+                    if f.startswith("."):
                         continue
                     self.samples.append(
                         (os.path.join(lr_p, f), os.path.join(hr_p, f))
@@ -62,20 +62,19 @@ class VideoDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        lr_img = Image.open(self.samples[idx][0]).convert('RGB')
-        hr_img = Image.open(self.samples[idx][1]).convert('RGB')
+        lr = Image.open(self.samples[idx][0]).convert("RGB")
+        hr = Image.open(self.samples[idx][1]).convert("RGB")
 
-        return self.transform_lr(lr_img), self.transform_hr(hr_img)
+        return self.transform_lr(lr), self.transform_hr(hr)
 
 # =========================
-# 3. MODEL (KAN-SR)
+# 3. MODEL
 # =========================
 class KAN_SR(nn.Module):
     def __init__(self):
         super().__init__()
 
         self.conv_in = nn.Conv2d(3, 32, 3, padding=1)
-
         self.kan = KAN([32, 64, 32], grid_size=3)
 
         self.upsample = nn.Sequential(
@@ -90,7 +89,6 @@ class KAN_SR(nn.Module):
 
         feat = torch.relu(self.conv_in(x))
 
-        # OPTIMIZED FLATTEN
         feat_flat = feat.permute(0, 2, 3, 1).reshape(-1, 32)
 
         out = self.kan(feat_flat)
@@ -100,16 +98,16 @@ class KAN_SR(nn.Module):
         return self.upsample(feat)
 
 # =========================
-# 4. TRAINING LOOP (GPU OPTIMIZED)
+# 4. TRAINING
 # =========================
 def train():
     dataset = VideoDataset("data")
 
     dataloader = DataLoader(
         dataset,
-        batch_size=8,              # V100 có thể tăng lên 8–16
+        batch_size=8,
         shuffle=True,
-        num_workers=4,             # tăng tốc load data
+        num_workers=4,
         pin_memory=True
     )
 
@@ -125,8 +123,8 @@ def train():
     criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    # AMP (mixed precision)
-    scaler = torch.cuda.amp.GradScaler()
+    # ✅ FIX AMP (NEW API)
+    scaler = torch.amp.GradScaler('cuda')
 
     for epoch in range(10):
         model.train()
@@ -143,7 +141,8 @@ def train():
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            # ✅ FIX AUTOCAST
+            with torch.amp.autocast(device_type="cuda"):
                 output = model(lr)
                 loss = criterion(output, hr)
 
@@ -153,10 +152,15 @@ def train():
 
             total_loss += loss.item()
 
-            # metric (no grad)
+            # =========================
+            # ✅ FIX SSIM + PSNR (FP32 ONLY)
+            # =========================
             with torch.no_grad():
-                p = psnr(output, hr, data_range=1.0)
-                s = ssim(output, hr, data_range=1.0)
+                out_fp32 = output.float()
+                hr_fp32 = hr.float()
+
+                p = psnr(out_fp32, hr_fp32, data_range=1.0)
+                s = ssim(out_fp32, hr_fp32, data_range=1.0)
 
                 total_psnr += p.item()
                 total_ssim += s.item()
