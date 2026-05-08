@@ -8,19 +8,17 @@ from PIL import Image
 import os
 from tqdm import tqdm
 import torch.nn.functional as F
-
 from efficient_kan import KAN
 from piq import psnr, ssim
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 Using device: {device}")
-
 if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
 # =========================
-# DATASET (giữ nguyên)
+# DATASET
 # =========================
 class VideoDataset(Dataset):
     def __init__(self, root_dir, target_size=(160, 90)):
@@ -50,88 +48,121 @@ class VideoDataset(Dataset):
         return self.transform_lr(lr), self.transform_hr(hr)
 
 # =========================
-# RESIDUAL BLOCK (thêm mới)
+# RESIDUAL BLOCK (nhẹ hơn - bỏ BatchNorm → GroupNorm)
 # =========================
 class ResidualBlock(nn.Module):
     def __init__(self, channels=64):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8, channels),   # GroupNorm nhẹ hơn BatchNorm
             nn.PReLU(),
             nn.Conv2d(channels, channels, 3, padding=1),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8, channels),
         )
-
     def forward(self, x):
-        return x + self.block(x)  # skip connection
+        return x + self.block(x)
 
 # =========================
-# MODEL CẢI TIẾN
+# MODEL TỐI ƯU: KAN_SR_V3
+# KEY IDEA: KAN chỉ hoạt động trên feature map đã được
+# spatial pooling (H/4 × W/4) thay vì full resolution
+# → giảm ~16x số vectors đưa vào KAN
 # =========================
-class KAN_SR_V2(nn.Module):
-    def __init__(self, upscale_factor=2, num_res_blocks=8):
+class KAN_SR_V3(nn.Module):
+    def __init__(self, upscale_factor=2, num_res_blocks=6):
         super().__init__()
         self.upscale_factor = upscale_factor
 
-        # ① Feature extraction sâu hơn
+        # ① Shallow feature extraction
         self.entry = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=9, padding=4),
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
             nn.PReLU()
         )
 
-        # ② Stack Residual Blocks để học đặc trưng phong phú
+        # ② Residual blocks (giảm xuống 6 thay vì 8)
         self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(num_res_blocks)])
+        self.post_res   = nn.Conv2d(64, 64, 3, padding=1)
 
-        self.post_res = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.BatchNorm2d(64)
+        # ③ Compress spatial trước KAN: 90×160 → 23×40 (÷4)
+        #    KAN xử lý ~920 vectors thay vì 14,400 vectors/sample
+        self.pre_kan = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # /2
+            nn.PReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1), # /2
+            nn.PReLU(),
         )
 
-        # ③ KAN: học ánh xạ phi tuyến từ feature → enhanced feature
-        #    Tăng grid_size=8 để xấp xỉ hàm phức tạp hơn
-        self.kan = KAN([64, 256, 128, 64], grid_size=8)
+        # ④ KAN hoạt động ở không gian nén — grid_size=5 đủ dùng
+        self.kan = KAN([128, 256, 128], grid_size=5)
 
-        # ④ Upsampling bằng PixelShuffle (sub-pixel convolution)
-        self.upsample = nn.Sequential(
-            nn.Conv2d(64, 256, kernel_size=3, padding=1),
-            nn.PixelShuffle(upscale_factor),        # 256 → 64 channels, H×W → 2H×2W
+        # ⑤ Expand trở lại sau KAN
+        self.post_kan = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.PReLU(),
-            nn.Conv2d(64, 3, kernel_size=9, padding=4),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.PReLU(),
+        )
+
+        # ⑥ Upsample × upscale_factor
+        self.upsample = nn.Sequential(
+            nn.Conv2d(64, 64 * (upscale_factor ** 2), kernel_size=3, padding=1),
+            nn.PixelShuffle(upscale_factor),
+            nn.PReLU(),
+            nn.Conv2d(64, 3, kernel_size=3, padding=1),
+        )
+
+        # ⑦ Channel attention (SE block) — học xem kênh nào quan trọng
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(64, 16),
+            nn.ReLU(),
+            nn.Linear(16, 64),
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
-        # Bicubic base (skip connection toàn cục)
+        b, c, h, w = x.shape
+
+        # Global skip: bicubic
         base = F.interpolate(x, scale_factor=self.upscale_factor,
                              mode='bicubic', align_corners=False)
 
-        b, c, h, w = x.shape
+        # Feature extraction
+        feat = self.entry(x)
+        feat = feat + self.post_res(self.res_blocks(feat))  # residual learning
 
-        # Feature path
-        feat = self.entry(x)                        # [B, 64, H, W]
-        res  = self.res_blocks(feat)
-        feat = feat + self.post_res(res)            # long skip
+        # SE channel attention
+        se_w = self.se(feat).view(b, 64, 1, 1)
+        feat = feat * se_w
 
-        # KAN refinement (pixel-wise)
-        flat = feat.permute(0,2,3,1).reshape(-1, 64)
-        kan_out = self.kan(flat)                    # [-1, 64]
-        feat2 = kan_out.view(b, h, w, 64).permute(0,3,1,2)
+        # KAN trên spatial nén
+        compressed = self.pre_kan(feat)          # [B, 128, H/4, W/4]
+        bk, ck, hk, wk = compressed.shape
+        flat = compressed.permute(0,2,3,1).reshape(-1, 128)
+        kan_out = self.kan(flat)
+        refined = kan_out.view(bk, hk, wk, 128).permute(0,3,1,2)
+
+        # Expand + merge
+        expanded = self.post_kan(refined)        # [B, 64, H, W]
+        fused = feat + expanded                  # skip connection
 
         # Upsample residual
-        residual = self.upsample(feat2)             # [B, 3, 2H, 2W]
+        residual = self.upsample(fused)          # [B, 3, 2H, 2W]
 
         return torch.clamp(base + residual, 0.0, 1.0)
 
 
 # =========================
-# PERCEPTUAL LOSS (VGG)
+# PERCEPTUAL LOSS (nhẹ: chỉ relu1_2 thay vì relu2_2)
 # =========================
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
         vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
-        # Lấy đến relu2_2 (không quá sâu, tránh mất spatial info)
-        self.slice = nn.Sequential(*list(vgg.children())[:9]).eval()
+        self.slice = nn.Sequential(*list(vgg.children())[:4]).eval()  # chỉ lấy relu1_2
         for p in self.parameters():
             p.requires_grad = False
 
@@ -140,12 +171,14 @@ class PerceptualLoss(nn.Module):
 
 
 # =========================
-# FREQUENCY LOSS (FFT) - thêm mới
+# FREQUENCY LOSS (chỉ tính trên 1 channel để nhẹ hơn)
 # =========================
 def frequency_loss(pred, target):
-    """Phạt sự khác biệt trong miền tần số - phục hồi cạnh sắc nét"""
-    pred_fft   = torch.fft.fft2(pred.float())
-    target_fft = torch.fft.fft2(target.float())
+    # Chuyển sang grayscale trước FFT → 3x nhẹ hơn
+    pred_gray   = 0.299*pred[:,0] + 0.587*pred[:,1] + 0.114*pred[:,2]
+    target_gray = 0.299*target[:,0] + 0.587*target[:,1] + 0.114*target[:,2]
+    pred_fft    = torch.fft.rfft2(pred_gray.float())
+    target_fft  = torch.fft.rfft2(target_gray.float())
     return F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
 
 
@@ -154,32 +187,32 @@ def frequency_loss(pred, target):
 # =========================
 def train():
     dataset    = VideoDataset("data")
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True,
-                            num_workers=4, pin_memory=True)
+    dataloader = DataLoader(
+        dataset, batch_size=16,     # tăng batch size vì model nhẹ hơn
+        shuffle=True, num_workers=4, pin_memory=True,
+        prefetch_factor=2           # prefetch để GPU không bị idle
+    )
 
-    # ✅ FIX: dùng đúng class KAN_SR_V2
-    model = KAN_SR_V2(upscale_factor=2, num_res_blocks=8).to(device)
+    model = KAN_SR_V3(upscale_factor=2, num_res_blocks=6).to(device)
 
-    model_path = "kan_upscale_v2.pth"
+    model_path = "kan_upscale_v3.pth"
     if os.path.exists(model_path):
         print(f"♻️ Loading model: {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=device))
 
-    # Load v1 nếu muốn fine-tune tiếp (optional)
-    # model.load_state_dict(torch.load("kan_upscale_v1.pth", ...), strict=False)
-
     perc_loss_fn = PerceptualLoss().to(device)
+    criterion    = nn.L1Loss()
+    optimizer    = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
 
-    criterion  = nn.L1Loss()
-    optimizer  = optim.Adam(model.parameters(), lr=2e-4, betas=(0.9, 0.999))
+    # Warm-up 2 epoch rồi cosine decay
+    def lr_lambda(epoch):
+        if epoch < 2: return epoch / 2       # warm up
+        return 0.5 * (1 + torch.cos(torch.tensor((epoch-2) / 18 * 3.14159)).item())
 
-    # ✅ Cosine Annealing: LR giảm dần theo chu kỳ
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
-
-    scaler = torch.amp.GradScaler('cuda')
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler    = torch.amp.GradScaler('cuda')
 
     NUM_EPOCHS = 20
-
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = total_psnr = total_ssim = 0
@@ -188,24 +221,18 @@ def train():
         for lr_img, hr_img in loop:
             lr_img = lr_img.to(device, non_blocking=True)
             hr_img = hr_img.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)   # nhanh hơn zero_grad()
 
             with torch.amp.autocast(device_type="cuda"):
                 output = model(lr_img)
-
-                # ── Tổ hợp loss ──────────────────────────────
-                l1   = criterion(output, hr_img)
-                perc = perc_loss_fn(output, hr_img)
-                freq = frequency_loss(output, hr_img)
-
-                # Trọng số: L1 chính, perceptual và freq bổ trợ
-                loss = l1 + 0.01 * perc + 0.05 * freq
+                l1     = criterion(output, hr_img)
+                perc   = perc_loss_fn(output, hr_img)
+                freq   = frequency_loss(output, hr_img)
+                loss   = l1 + 0.01 * perc + 0.05 * freq
 
             scaler.scale(loss).backward()
-            # Gradient clipping tránh exploding gradient
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -219,19 +246,19 @@ def train():
                 total_psnr += p.item()
                 total_ssim += s.item()
 
-            loop.set_postfix(loss=f"{loss.item():.4f}",
-                             psnr=f"{p.item():.2f}",
-                             ssim=f"{s.item():.3f}",
-                             lr=f"{scheduler.get_last_lr()[0]:.1e}")
+            loop.set_postfix(
+                loss=f"{loss.item():.4f}",
+                psnr=f"{p.item():.2f}",
+                ssim=f"{s.item():.3f}",
+            )
 
         scheduler.step()
-
         n = len(dataloader)
         print(f"\n✨ Epoch {epoch+1}: "
               f"Loss {total_loss/n:.4f} | "
               f"PSNR {total_psnr/n:.2f} | "
               f"SSIM {total_ssim/n:.4f} | "
-              f"LR {scheduler.get_last_lr()[0]:.1e}")
+              f"LR {scheduler.get_last_lr()[0]:.2e}")
 
         torch.save(model.state_dict(), model_path)
 
