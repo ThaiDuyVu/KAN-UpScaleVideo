@@ -71,11 +71,10 @@ class VideoDataset(Dataset):
             if random.random() > 0.5:
                 lr = lr.transpose(Image.FLIP_TOP_BOTTOM)
                 hr = hr.transpose(Image.FLIP_TOP_BOTTOM)
-            # Random rotate 90°
+            # Random rotate 180° only (giữ nguyên H×W)
             if random.random() > 0.5:
-                k = random.choice([Image.ROTATE_90, Image.ROTATE_180, Image.ROTATE_270])
-                lr = lr.transpose(k)
-                hr = hr.transpose(k)
+                lr = lr.transpose(Image.ROTATE_180)
+                hr = hr.transpose(Image.ROTATE_180)
 
         return self.to_tensor(lr), self.to_tensor(hr)
 
